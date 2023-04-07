@@ -1,26 +1,60 @@
 ﻿using System;
-using System.Collections.Generic;
 using System.IO;
-using System.Linq;
-using System.Text;
 using System.Threading.Tasks;
 
 using System.IO.Compression;
-using System.Net;
 using System.Collections.Concurrent;
+using System.Net;
+using System.Threading;
 
 namespace ZipTester
 {
     internal class Program
     {
+        // class code copied from: https://stackoverflow.com/questions/3670057/does-console-writeline-block
+        internal static class NonBlockingConsole 
+        { 
+            private static BlockingCollection<string> m_Queue = new BlockingCollection<string>();
+
+            static NonBlockingConsole()
+            {
+                var thread = new Thread(
+                  () =>
+                  {
+                      while (true) Console.WriteLine(m_Queue.Take());
+                  });
+                thread.IsBackground = true;
+                thread.Start();
+            }
+
+            public static void WriteLine(string value)
+            {
+                m_Queue.Add(value);
+            }
+
+            public static void Flush()
+            {
+                int sleepDuration = 1000;
+                Thread.Sleep(sleepDuration);
+                while (m_Queue.Count > 0)
+                {
+                    sleepDuration = Math.Min(sleepDuration / 2, 2);
+                    Thread.Sleep(sleepDuration);
+                }
+            }
+        }
+
         internal struct EntryData
         {
             public string archiveFullName;
             public string entryFullName;
         }
 
-        private const string testPath = "C:\\Users\\tyn\\Downloads";
+        private const string testPath = "C:\\Users\\tyn\\Downloads\\HumbleBundle\\page 2\\audio - Music Creators Unlimited Sounds Loops and Instruments";
+        //private const string testPath = "C:\\Users\\tyn\\Downloads";
         private const string zipExtension = "*.zip";
+        private const int readSize = 4096;
+        private const int bufferSize = 262144;
 
         static void Main(string[] args)
         {   
@@ -42,17 +76,16 @@ namespace ZipTester
                 //SequentialTestEntries(fInfo.FullName);
 
                 ParallelTestEntries(fInfo.FullName);
-
-                //break; // only do 1 file for now.
             }
 
+            NonBlockingConsole.Flush();
             Console.WriteLine("finished!");
             Console.ReadLine();
         }
 
         private static void SequentialTestEntries(string fullName)
         {
-            byte[] buffer = new byte[4096];
+            byte[] buffer = new byte[readSize];
             int quantityRead;
             long uncompressedLength;
             long quantityAccumulated;
@@ -64,7 +97,7 @@ namespace ZipTester
                 quantityAccumulated = 0;
                 uncompressedLength = zArchiveEntry.Length;
                 Stream entryStream = zArchiveEntry.Open();
-                BufferedStream entryStreamBuf = new BufferedStream(entryStream, 65536);
+                BufferedStream entryStreamBuf = new BufferedStream(entryStream, bufferSize);
 
                 while (quantityAccumulated < uncompressedLength)
                 {
@@ -74,7 +107,6 @@ namespace ZipTester
                     {
                         if (quantityAccumulated != uncompressedLength)
                         {
-                            // failed to read when should have been able to.
                             Console.WriteLine("    WARNING: failed to read past byte " + quantityAccumulated + " in compressed data for " + zArchiveEntry.FullName);
                             break;
                         }
@@ -91,28 +123,19 @@ namespace ZipTester
         private static void ParallelTestEntries(string fullName)
         {
             var entries = new ConcurrentBag<EntryData>();
-            ZipArchive zArchive = ZipFile.OpenRead(fullName);
+            ZipArchive zArchive = ZipFile.OpenRead(fullName); // note: something to do with threading invalidates the open file handle in child threads
             foreach (var zEntry in zArchive.Entries)
             {
                 entries.Add(new EntryData() { archiveFullName = fullName, entryFullName = zEntry.FullName });
             }
             zArchive.Dispose();
 
-            var failedTests = new ConcurrentBag<string>();
             Parallel.ForEach(entries, zEntryData =>
             {
-                string result = TestZipEntry(zEntryData);
-                if (result.Length > 0)
-                {
-                    failedTests.Add(result);
-                }
+                TestZipEntry(zEntryData);
             }
             );
 
-            foreach (var failureMessage in failedTests)
-            {
-                Console.WriteLine(failureMessage);
-            }
         }
 
         private static string TestZipEntry(EntryData eData)
@@ -122,13 +145,13 @@ namespace ZipTester
             ZipArchive zArchive = ZipFile.OpenRead(eData.archiveFullName);
             ZipArchiveEntry entry = zArchive.GetEntry(eData.entryFullName);
 
-            byte[] buffer = new byte[4096];
+            byte[] buffer = new byte[readSize];
             int quantityRead;
 
             long quantityAccumulated = 0;
             long uncompressedLength = entry.Length;
             Stream entryStream = entry.Open();
-            BufferedStream entryStreamBuf = new BufferedStream(entryStream, 65536);
+            BufferedStream entryStreamBuf = new BufferedStream(entryStream, bufferSize);
 
             while (quantityAccumulated < uncompressedLength)
             {
@@ -139,7 +162,7 @@ namespace ZipTester
                     if (quantityAccumulated != uncompressedLength)
                     {
                         // failed to read when should have been able to.
-                        result = "    WARNING: failed to read past byte " + quantityAccumulated + " in compressed data for " + entry.FullName;
+                        NonBlockingConsole.WriteLine("    WARNING: failed to read past byte " + quantityAccumulated + " in compressed data for " + entry.FullName);
                         break;
                     }
                 }
