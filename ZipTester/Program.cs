@@ -4,7 +4,6 @@ using System.Threading.Tasks;
 
 using System.IO.Compression;
 using System.Collections.Concurrent;
-using System.Net;
 using System.Threading;
 
 namespace ZipTester
@@ -50,7 +49,7 @@ namespace ZipTester
             public string entryFullName;
         }
 
-        private const string testPath = "C:\\Users\\tyn\\Downloads\\HumbleBundle\\page 2\\audio - Music Creators Unlimited Sounds Loops and Instruments";
+        private const string testPath = "C:\\Users\\tyn\\Downloads\\HumbleBundle\\page 2";
         //private const string testPath = "C:\\Users\\tyn\\Downloads";
         private const string zipExtension = "*.zip";
         private const int readSize = 4096;
@@ -66,21 +65,24 @@ namespace ZipTester
                 Environment.Exit(-1);
             }
 
-            // enumerate files
-            int count = 0;
-            foreach ( var fInfo in dInfo.EnumerateFiles(zipExtension, SearchOption.AllDirectories) )
-            {
-                count++;
-                Console.WriteLine("[" + count + "] PROCESING : " + fInfo.FullName);
-
-                //SequentialTestEntries(fInfo.FullName);
-
-                ParallelTestEntries(fInfo.FullName);
-            }
+            ParallelTestFiles(dInfo);
 
             NonBlockingConsole.Flush();
             Console.WriteLine("finished!");
             Console.ReadLine();
+        }
+
+        private static void SequentialTestFiles(DirectoryInfo dInfo)
+        {
+            // enumerate files
+            int count = 0;
+            foreach (var fInfo in dInfo.EnumerateFiles(zipExtension, SearchOption.AllDirectories))
+            {
+                count++;
+                Console.WriteLine("[" + count + "] PROCESING : " + fInfo.FullName);
+
+                SequentialTestEntries(fInfo.FullName);
+            }
         }
 
         private static void SequentialTestEntries(string fullName)
@@ -120,10 +122,27 @@ namespace ZipTester
             zArchive.Dispose();
         }
 
+        private static void ParallelTestFiles(DirectoryInfo dInfo)
+        {
+            // enumerate files
+            int count = 0;
+            Parallel.ForEach(dInfo.EnumerateFiles(zipExtension, SearchOption.AllDirectories), fInfo =>
+            {
+                count++;
+                NonBlockingConsole.WriteLine("[" + count + "] PROCESING : " + fInfo.FullName);
+
+                ParallelTestEntries(fInfo.FullName);
+            });
+            NonBlockingConsole.WriteLine("" + count + " files processed");
+        }
+
         private static void ParallelTestEntries(string fullName)
         {
+            // note: something to do with threading invalidates the open file handle in child threads
+            //  so I copy the zip archive entry names into a structure and do all the file opening
+            //  in the child threads i.e. each thread has its own open (read only) file handle.
             var entries = new ConcurrentBag<EntryData>();
-            ZipArchive zArchive = ZipFile.OpenRead(fullName); // note: something to do with threading invalidates the open file handle in child threads
+            ZipArchive zArchive = ZipFile.OpenRead(fullName); 
             foreach (var zEntry in zArchive.Entries)
             {
                 entries.Add(new EntryData() { archiveFullName = fullName, entryFullName = zEntry.FullName });
