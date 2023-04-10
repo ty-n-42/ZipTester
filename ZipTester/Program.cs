@@ -1,18 +1,18 @@
 ﻿using System;
 using System.IO;
 using System.Threading.Tasks;
-
 using System.IO.Compression;
 using System.Collections.Concurrent;
 using System.Threading;
+using System.Linq;
 
 namespace ZipTester
 {
     internal class Program
     {
         // class code copied from: https://stackoverflow.com/questions/3670057/does-console-writeline-block
-        internal static class NonBlockingConsole 
-        { 
+        internal static class NonBlockingConsole // provides asynchronous Console writing
+        {
             private static BlockingCollection<string> m_Queue = new BlockingCollection<string>();
 
             static NonBlockingConsole()
@@ -20,7 +20,10 @@ namespace ZipTester
                 var thread = new Thread(
                   () =>
                   {
-                      while (true) Console.WriteLine(m_Queue.Take());
+                      while (true)
+                      {
+                          Console.WriteLine(m_Queue.Take());
+                      }
                   });
                 thread.IsBackground = true;
                 thread.Start();
@@ -28,13 +31,15 @@ namespace ZipTester
 
             public static void WriteLine(string value)
             {
+#if DEBUG
                 m_Queue.Add(value);
+#endif
             }
 
             public static void Flush()
             {
                 int sleepDuration = 1000;
-                Thread.Sleep(sleepDuration);
+                Thread.Sleep(sleepDuration); // wait a moment for 
                 while (m_Queue.Count > 0)
                 {
                     sleepDuration = Math.Min(sleepDuration / 2, 2);
@@ -43,124 +48,100 @@ namespace ZipTester
             }
         }
 
-        internal struct EntryData
+        internal struct EntryData // structure to hold zip file entry identifying information - for passing to threads executing in parallel
         {
             public string archiveFullName;
             public string entryFullName;
         }
 
-        private const string testPath = "C:\\Users\\tyn\\Downloads\\HumbleBundle\\page 2";
-        //private const string testPath = "C:\\Users\\tyn\\Downloads";
-        private const string zipExtension = "*.zip";
-        private const int readSize = 4096;
-        private const int bufferSize = 262144;
+        private const string testPath = "C:\\test"; // top folder path for searching for zip files
+        private const string zipExtension = "*.zip"; // extension to filter file system files to identify zip files
+        private const int readSize = 1024 * 64; // memory size for reading from zip file entry stream
+        private const int bufferSize = 1024 * 1024; // stream buffer size for reading zip file entries 
+        private const long compressedLengthBoundary = 1024 * 512; // minimum size for compressed zip file entry to be processed in parallel
 
         static void Main(string[] args)
         {   
-            // search the path for zip files
             DirectoryInfo dInfo = new DirectoryInfo(testPath);
             if (dInfo.Exists != true)
             {
                 Console.WriteLine("ERROR: path does not exist: " + testPath);
                 Environment.Exit(-1);
             }
+            Console.WriteLine("START: " + dInfo.FullName);
 
-            ParallelTestFiles(dInfo);
+            // search the path for zip files
+            long count = 0;
+            Parallel.ForEach(dInfo.EnumerateFiles(zipExtension, SearchOption.AllDirectories), fInfo =>
+            { // process each file in parallel
+                NonBlockingConsole.WriteLine("[" + (++count).ToString("N0") + "] PROCESING : " + fInfo.FullName);
+
+                ZipArchive zArchive = ZipFile.OpenRead(fInfo.FullName);
+
+                // filter the zip file entries for items suitable for parallel processing - large compressed size
+                System.Collections.Generic.IEnumerable<EntryData> filteredEntries = zArchive.Entries
+                    .Where<ZipArchiveEntry>(entry => entry.CompressedLength >= compressedLengthBoundary)
+                    .Select(entry => new EntryData { archiveFullName = fInfo.FullName, entryFullName = entry.FullName });
+                var entriesForParallel = new ConcurrentBag<EntryData>(filteredEntries);
+
+                // execute independent threads for sequential and for parallel processing
+                Parallel.Invoke(
+                    () =>
+                    { // process sequentially
+                        byte[] buffer = new byte[readSize];
+                        int quantityRead;
+                        long quantityAccumulated;
+                        long uncompressedLength;
+                        Stream entryStream;
+                        BufferedStream entryStreamBuf;
+
+                        // process items suitable for sequential processing - small compressed size
+                        foreach (var entry in zArchive.Entries.Where<ZipArchiveEntry>(entry => entry.CompressedLength < compressedLengthBoundary))
+                        {
+                            uncompressedLength = entry.Length;
+                            entryStream = entry.Open();
+                            entryStreamBuf = new BufferedStream(entryStream, bufferSize);
+                            quantityAccumulated = 0;
+                            NonBlockingConsole.WriteLine("  READING: (s_" + entry.CompressedLength.ToString("N0") + "b) " + entry.FullName);
+                            while (quantityAccumulated < uncompressedLength)
+                            {
+                                quantityRead = entryStreamBuf.Read(buffer, 0, buffer.Length);
+                                quantityAccumulated += quantityRead;
+                                if (quantityRead != buffer.Length)
+                                {
+                                    if (quantityAccumulated != uncompressedLength)
+                                    {
+                                        // failed to read when should have been able to.
+                                        NonBlockingConsole.WriteLine("    WARNING: failed to read past byte " + quantityAccumulated + " in compressed data for " + entry.FullName);
+                                        break;
+                                    }
+                                }
+                            }
+
+                            entryStreamBuf.Close();
+                            entryStream.Close();
+                        }
+                    },
+                    () =>
+                    { // process in parallel
+                        Parallel.ForEach(entriesForParallel, entry =>
+                        {
+                            TestZipEntry(entry, true);
+                        });
+                    }
+                    );
+
+                zArchive.Dispose();
+            
+            });
 
             NonBlockingConsole.Flush();
-            Console.WriteLine("finished!");
+            Console.WriteLine("END: processed " + count + " zip files");
             Console.ReadLine();
         }
 
-        private static void SequentialTestFiles(DirectoryInfo dInfo)
+        private static void TestZipEntry(EntryData eData, bool isParallel)
         {
-            // enumerate files
-            int count = 0;
-            foreach (var fInfo in dInfo.EnumerateFiles(zipExtension, SearchOption.AllDirectories))
-            {
-                count++;
-                Console.WriteLine("[" + count + "] PROCESING : " + fInfo.FullName);
-
-                SequentialTestEntries(fInfo.FullName);
-            }
-        }
-
-        private static void SequentialTestEntries(string fullName)
-        {
-            byte[] buffer = new byte[readSize];
-            int quantityRead;
-            long uncompressedLength;
-            long quantityAccumulated;
-
-            // test all the zip file contents
-            ZipArchive zArchive = ZipFile.OpenRead(fullName);
-            foreach (ZipArchiveEntry zArchiveEntry in zArchive.Entries)
-            {
-                quantityAccumulated = 0;
-                uncompressedLength = zArchiveEntry.Length;
-                Stream entryStream = zArchiveEntry.Open();
-                BufferedStream entryStreamBuf = new BufferedStream(entryStream, bufferSize);
-
-                while (quantityAccumulated < uncompressedLength)
-                {
-                    quantityRead = entryStreamBuf.Read(buffer, 0, buffer.Length);
-                    quantityAccumulated += quantityRead;
-                    if (quantityRead != buffer.Length)
-                    {
-                        if (quantityAccumulated != uncompressedLength)
-                        {
-                            Console.WriteLine("    WARNING: failed to read past byte " + quantityAccumulated + " in compressed data for " + zArchiveEntry.FullName);
-                            break;
-                        }
-                    }
-                }
-
-                entryStreamBuf.Close();
-                entryStream.Close();
-            }
-
-            zArchive.Dispose();
-        }
-
-        private static void ParallelTestFiles(DirectoryInfo dInfo)
-        {
-            // enumerate files
-            int count = 0;
-            Parallel.ForEach(dInfo.EnumerateFiles(zipExtension, SearchOption.AllDirectories), fInfo =>
-            {
-                count++;
-                NonBlockingConsole.WriteLine("[" + count + "] PROCESING : " + fInfo.FullName);
-
-                ParallelTestEntries(fInfo.FullName);
-            });
-            NonBlockingConsole.WriteLine("" + count + " files processed");
-        }
-
-        private static void ParallelTestEntries(string fullName)
-        {
-            // note: something to do with threading invalidates the open file handle in child threads
-            //  so I copy the zip archive entry names into a structure and do all the file opening
-            //  in the child threads i.e. each thread has its own open (read only) file handle.
-            var entries = new ConcurrentBag<EntryData>();
-            ZipArchive zArchive = ZipFile.OpenRead(fullName); 
-            foreach (var zEntry in zArchive.Entries)
-            {
-                entries.Add(new EntryData() { archiveFullName = fullName, entryFullName = zEntry.FullName });
-            }
-            zArchive.Dispose();
-
-            Parallel.ForEach(entries, zEntryData =>
-            {
-                TestZipEntry(zEntryData);
-            }
-            );
-
-        }
-
-        private static string TestZipEntry(EntryData eData)
-        {
-            string result = "";
-
             ZipArchive zArchive = ZipFile.OpenRead(eData.archiveFullName);
             ZipArchiveEntry entry = zArchive.GetEntry(eData.entryFullName);
 
@@ -172,6 +153,7 @@ namespace ZipTester
             Stream entryStream = entry.Open();
             BufferedStream entryStreamBuf = new BufferedStream(entryStream, bufferSize);
 
+            NonBlockingConsole.WriteLine("  READING: (" + (isParallel ? "p_" : "s_") + entry.CompressedLength.ToString("N0") + "b) " + entry.FullName);
             while (quantityAccumulated < uncompressedLength)
             {
                 quantityRead = entryStreamBuf.Read(buffer, 0, buffer.Length);
@@ -191,7 +173,7 @@ namespace ZipTester
             entryStream.Close();
             zArchive.Dispose();
 
-            return result;
+            return;
         }
     }
 }
